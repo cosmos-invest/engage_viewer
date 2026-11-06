@@ -123,10 +123,13 @@ def render(events, author, follower_ids):
         matched = len(denominator.intersection(people))
         pct = f'{matched}/{len(denominator)}人（{matched/len(denominator):.1%}）' if denominator else '算出不可'
         metric = 'フォロワー反応率' if follower_ids is not None else 'フォロー通知で確認できた人の反応率'
-        top_articles = ''.join(f'<li>{article_link(a)} · {len(users)}人</li>' for a, users in sorted(articles.items(), key=lambda item: (-len(item[1]), item[0]))[:20])
-        return (f'<p>反応者 {len(people)}人 · {metric} {pct}</p><table><thead><tr><th>読者<th>反応記事<th>スキ記事'
+        repeat = {person for person, counts in people.items() if len(counts['like'] | counts['comment']) >= 3}
+        ranked_articles = sorted(articles.items(), key=lambda item: (-len(item[1] & repeat), -len(item[1]), item[0]))
+        top_articles = ''.join(f'<li>{article_link(a)} · リピーター {len(users & repeat)}人 / 反応者 {len(users)}人</li>'
+                               for a, users in ranked_articles[:20])
+        return (f'<p>反応者 {len(people)}人 · リピーター {len(repeat)}人 · {metric} {pct}</p><table><thead><tr><th>読者<th>反応記事<th>スキ記事'
                 f'<th>コメント記事<th>フォロー確認<th>内訳</thead><tbody>{"".join(rows)}</tbody></table>'
-                f'<h3>反応した人数が多い記事</h3><ol>{top_articles}</ol>')
+                f'<h3>リピーターの反応が多い記事</h3><ol>{top_articles}</ol>')
 
     as_of = datetime.fromtimestamp(latest / 1000, JST).strftime('%Y-%m-%d %H:%M') if latest else '通知なし'
     return f"""<!doctype html><html lang="ja"><meta charset="utf-8">
@@ -137,7 +140,7 @@ table{{border-collapse:collapse;width:100%;font-size:.9rem}}td,th{{padding:8px;b
 a{{color:#53417a}}summary{{cursor:pointer}}
 </style><h1>Engage Viewer 🌙</h1>
 <p>通知の最終受信 {as_of} JST · 照合できなかった通知 {skipped}通</p>
-<p>反応記事数はスキとコメントを合わせた記事数です。フォロー通知は過去の履歴です。閲覧のみの読者は集計できません。</p>
+<p>反応記事数はスキとコメントを合わせた記事数です。3記事以上に反応した人をリピーターとして表示します。フォロー通知は過去の履歴です。閲覧のみの読者は集計できません。</p>
 <details open><summary>直近30日（最終通知が基準）</summary>{table(cutoff)}</details>
 <details><summary>全期間</summary>{table(0)}</details>"""
 
