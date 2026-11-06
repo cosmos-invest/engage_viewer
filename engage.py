@@ -22,7 +22,7 @@ SCOPE = ['https://www.googleapis.com/auth/gmail.readonly']
 def messages(service, account):
     api = service.users().messages()
     query = ('in:anywhere from:noreply@note.com to:' + account +
-             ' {' + ' '.join(f'subject:"{subject}"' for subject in (*SUBJECTS, 'さんにスキされました')) + '}')
+             ' {' + ' '.join(f'subject:"{subject}"' for subject in (*SUBJECTS, 'さんにスキされました', 'さんにフォローされました')) + '}')
     request = api.list(userId='me', q=query, includeSpamTrash=True, maxResults=500)
     while request is not None:
         page = request.execute(num_retries=5)
@@ -45,11 +45,12 @@ def parse(message, author):
     headers = {h['name'].lower(): h['value'] for h in part.get('headers', [])}
     subject = headers.get('subject', '').strip()
     legacy_like = re.fullmatch(r'(.+)さんにスキされました[！!]?', subject)
-    kind = 'like' if legacy_like else SUBJECTS.get(subject)
+    legacy_follow = re.fullmatch(r'(.+)さんにフォローされました[！!]?', subject)
+    kind = 'like' if legacy_like else 'follow' if legacy_follow else SUBJECTS.get(subject)
     if not kind:
         return None
     body = body_text(part, 'text/plain')
-    html = body_text(part, 'text/html') if not body else ''
+    html = body_text(part, 'text/html')
     person = re.search(r'▼クリエイターページをみる\s+https://note\.com/([a-zA-Z0-9_]+)(?=[?\s]|$)', body)
     if not person and html:
         profiles = re.finditer(r'https:%2F%2Fnote\.com%2F([a-zA-Z0-9_]+)(?=%3F|/\d/)', html, re.I)
@@ -66,9 +67,10 @@ def parse(message, author):
         link = re.search(r'<a\b[^>]*href="[^"]*%2F' + article[1] + r'[^"]*"[^>]*>(.*?)</a>', html, re.I | re.S)
         if link:
             title = unescape(re.sub(r'<[^>]+>', '', link[1])).strip()
+    legacy = legacy_like or legacy_follow
     return {
         'kind': kind, 'time': int(message['internalDate']),
-        'person': person[1].lower() if person else '', 'name': intro[1] if intro else (legacy_like[1] if legacy_like else ''),
+        'person': person[1].lower() if person else '', 'name': intro[1] if intro else (legacy[1] if legacy else ''),
         'article': article[1] if article and kind != 'follow' else '', 'title': title,
     }
 
@@ -140,6 +142,42 @@ a{{color:#53417a}}summary{{cursor:pointer}}
 <details><summary>全期間</summary>{table(0)}</details>"""
 
 
+def collect(service, api, cache, ids, account, author):
+    cache.execute('CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
+    prefix = f'v3:{account}:{author}:'
+    events = []
+    missing = []
+    for message_id in ids:
+        cached = cache.execute('SELECT data FROM events WHERE id = ?', (prefix + message_id,)).fetchone()
+        if cached is None:
+            missing.append(message_id)
+        elif event := json.loads(cached[0]):
+            events.append(event)
+
+    for offset in range(0, len(missing), 25):
+        group = missing[offset:offset + 25]
+        fetched = {}
+
+        def receive(message_id, response, error):
+            if error is None:
+                fetched[message_id] = response
+
+        batch = service.new_batch_http_request(callback=receive)
+        for message_id in group:
+            batch.add(api.get(userId='me', id=message_id, format='full'), request_id=message_id)
+        batch.execute()
+        for message_id in group:
+            message = fetched.get(message_id)
+            if message is None:
+                message = api.get(userId='me', id=message_id, format='full').execute(num_retries=5)
+            event = parse(message, author)
+            cache.execute('INSERT OR REPLACE INTO events VALUES (?, ?)', (prefix + message_id, json.dumps(event)))
+            if event:
+                events.append(event)
+        cache.commit()
+    return events
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--account', required=True, help='note通知を受け取るGmailアドレス')
@@ -169,23 +207,10 @@ def main():
     service = build('gmail', 'v1', credentials=creds)
     api = service.users().messages()
     ids = dict.fromkeys(messages(service, args.account))
-    events = []
     fd = os.open(args.cache, os.O_WRONLY | os.O_CREAT, 0o600)
     os.close(fd)
     with sqlite3.connect(args.cache) as cache:
-        cache.execute('CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
-        for message_id in ids:
-            key = f'v2:{args.account}:{args.author}:{message_id}'
-            cached = cache.execute('SELECT data FROM events WHERE id = ?', (key,)).fetchone()
-            if cached:
-                event = json.loads(cached[0])
-            else:
-                message = api.get(userId='me', id=message_id, format='full').execute(num_retries=5)
-                event = parse(message, args.author)
-                cache.execute('INSERT OR REPLACE INTO events VALUES (?, ?)', (key, json.dumps(event)))
-                cache.commit()
-            if event:
-                events.append(event)
+        events = collect(service, api, cache, ids, args.account, args.author)
     followers = None
     if args.followers:
         followers = {line.strip().lower() for line in args.followers.read_text().splitlines() if line.strip()}
