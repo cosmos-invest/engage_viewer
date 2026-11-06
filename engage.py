@@ -3,7 +3,7 @@ import argparse
 import base64
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from html import escape
+from html import escape, unescape
 import json
 import os
 from pathlib import Path
@@ -22,7 +22,7 @@ SCOPE = ['https://www.googleapis.com/auth/gmail.readonly']
 def messages(service, account):
     api = service.users().messages()
     query = ('in:anywhere from:noreply@note.com to:' + account +
-             ' {' + ' '.join(f'subject:"{subject}"' for subject in SUBJECTS) + '}')
+             ' {' + ' '.join(f'subject:"{subject}"' for subject in (*SUBJECTS, 'さんにスキされました')) + '}')
     request = api.list(userId='me', q=query, includeSpamTrash=True, maxResults=500)
     while request is not None:
         page = request.execute(num_retries=5)
@@ -43,14 +43,17 @@ def body_text(part, mime_type):
 def parse(message, author):
     part = message['payload']
     headers = {h['name'].lower(): h['value'] for h in part.get('headers', [])}
-    kind = SUBJECTS.get(headers.get('subject', '').strip())
+    subject = headers.get('subject', '').strip()
+    legacy_like = re.fullmatch(r'(.+)さんにスキされました[！!]?', subject)
+    kind = 'like' if legacy_like else SUBJECTS.get(subject)
     if not kind:
         return None
     body = body_text(part, 'text/plain')
     html = body_text(part, 'text/html') if not body else ''
     person = re.search(r'▼クリエイターページをみる\s+https://note\.com/([a-zA-Z0-9_]+)(?=[?\s]|$)', body)
     if not person and html:
-        person = re.search(r'https:%2F%2Fnote\.com%2F([a-zA-Z0-9_]+)(?=%3F|/\d/)', html, re.I)
+        profiles = re.finditer(r'https:%2F%2Fnote\.com%2F([a-zA-Z0-9_]+)(?=%3F|/\d/)', html, re.I)
+        person = next((match for match in profiles if match[1].lower() != author), None)
     # The first article link is the target of the notification.
     article = re.search(r'https://note\.com/(?:notes|' + re.escape(author) + r'/n)/(n[a-f0-9]+)', body)
     if not article and html:
@@ -58,12 +61,15 @@ def parse(message, author):
                             + r'%2Fn)%2F(n[a-f0-9]+)', html, re.I)
     intro = (re.match(r'\s*(.*?)さんが(?:あなたを)?フォローしました', body or message.get('snippet', '')) if kind == 'follow'
              else re.match(r'\s*(.*?)さんが「(.*?)」に(?:スキ|コメント)しました', body, re.S))
-    comment = re.search(r'[?&]c=(n[a-f0-9]+)', body) if kind == 'comment' else None
+    title = intro[2] if intro and kind != 'follow' else ''
+    if not title and article and html:
+        link = re.search(r'<a\b[^>]*href="[^"]*%2F' + article[1] + r'[^"]*"[^>]*>(.*?)</a>', html, re.I | re.S)
+        if link:
+            title = unescape(re.sub(r'<[^>]+>', '', link[1])).strip()
     return {
         'kind': kind, 'time': int(message['internalDate']),
-        'person': person[1].lower() if person else '', 'name': intro[1] if intro else '',
-        'article': article[1] if article and kind != 'follow' else '', 'title': intro[2] if intro and kind != 'follow' else '',
-        'comment': comment[1] if comment else '',
+        'person': person[1].lower() if person else '', 'name': intro[1] if intro else (legacy_like[1] if legacy_like else ''),
+        'article': article[1] if article and kind != 'follow' else '', 'title': title,
     }
 
 
@@ -90,15 +96,13 @@ def render(events, author, follower_ids):
             follows.add(person)
 
     def table(since):
-        people = defaultdict(lambda: {'like': set(), 'comment': set(), 'comment_ids': set()})
+        people = defaultdict(lambda: {'like': set(), 'comment': set()})
         articles = defaultdict(set)
         for event in events:
             kind, person, article = event['kind'], event['person'], event['article']
             if event['time'] < since or kind == 'follow' or not person or not article or person == author:
                 continue
             people[person][kind].add(article)
-            if kind == 'comment' and event['comment']:
-                people[person]['comment_ids'].add(event['comment'])
             articles[article].add(person)
         def order(item):
             person, counts = item
@@ -171,7 +175,7 @@ def main():
     with sqlite3.connect(args.cache) as cache:
         cache.execute('CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
         for message_id in ids:
-            key = f'v1:{args.account}:{args.author}:{message_id}'
+            key = f'v2:{args.account}:{args.author}:{message_id}'
             cached = cache.execute('SELECT data FROM events WHERE id = ?', (key,)).fetchone()
             if cached:
                 event = json.loads(cached[0])
