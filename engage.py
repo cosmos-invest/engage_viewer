@@ -83,6 +83,7 @@ def render(events, author, follower_ids):
     cutoff = latest - 30 * 86400 * 1000
     names, titles, follows = {}, {}, set()
     skipped = 0
+    weeks = defaultdict(lambda: {'like': set(), 'comment': set(), 'follow': set()})
     for event in events:
         person, article = event['person'], event['article']
         if not person or (event['kind'] != 'follow' and not article):
@@ -94,8 +95,12 @@ def render(events, author, follower_ids):
             names[person] = event['name']
         if article and event['title']:
             titles[article] = event['title']
-        if event['kind'] == 'follow':
+        kind = event['kind']
+        if kind == 'follow':
             follows.add(person)
+        received = datetime.fromtimestamp(event['time'] / 1000, JST).date()
+        monday = received - timedelta(days=received.weekday())
+        weeks[monday][kind].add(person)
 
     def table(since):
         people = defaultdict(lambda: {'like': set(), 'comment': set()})
@@ -131,6 +136,9 @@ def render(events, author, follower_ids):
                 f'<th>コメント記事<th>フォロー確認<th>内訳</thead><tbody>{"".join(rows)}</tbody></table>'
                 f'<h3>リピーターの反応が多い記事</h3><ol>{top_articles}</ol>')
 
+    week_rows = ''.join(f'<tr><td>{week}<td>{len(groups["like"] | groups["comment"])}'
+                        f'<td>{len(groups["like"])}<td>{len(groups["comment"])}<td>{len(groups["follow"])}'
+                        for week, groups in sorted(weeks.items(), reverse=True))
     as_of = datetime.fromtimestamp(latest / 1000, JST).strftime('%Y-%m-%d %H:%M') if latest else '通知なし'
     return f"""<!doctype html><html lang="ja"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -142,7 +150,11 @@ a{{color:#53417a}}summary{{cursor:pointer}}
 <p>通知の最終受信 {as_of} JST · 照合できなかった通知 {skipped}通</p>
 <p>反応記事数はスキとコメントを合わせた記事数です。3記事以上に反応した人をリピーターとして表示します。フォロー通知は過去の履歴です。閲覧のみの読者は集計できません。</p>
 <details open><summary>直近30日（最終通知が基準）</summary>{table(cutoff)}</details>
-<details><summary>全期間</summary>{table(0)}</details>"""
+<details><summary>全期間</summary>{table(0)}</details>
+<details><summary>週ごとの通知</summary>
+<p>月曜始まり（日本時間）。各週で通知が確認できた人数です。</p>
+<table><thead><tr><th>週の開始<th>反応者<th>スキした人<th>コメントした人<th>フォロー通知あり
+</thead><tbody>{week_rows}</tbody></table></details>"""
 
 
 def collect(service, api, cache, ids, account, author):
